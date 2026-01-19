@@ -1,23 +1,27 @@
+import os
 import json
+import time
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
 import streamlit as st
 from streamlit_drawable_canvas import st_canvas
 
-from utils.mongo_backend import (
-    get_db,
-    ensure_indexes,
-    list_videos,
-    get_video_stats,
+from utils.frames import (
+    list_video_folders,
+    build_or_load_index,
+    build_clips_from_index,
+    get_clip_frames,
+    load_image_cached,
+)
+from utils.storage import (
+    ensure_video_annotation_dir,
+    load_latest_annotations_map,
     load_state,
     save_state,
-    load_clips,
-    load_annotations_map,
-    upsert_annotation,
+    append_annotation_record,
     compute_progress_counts,
     get_last_labeled_clip_idx,
-    load_frame_image_cached,
 )
 
 # -----------------------------
@@ -26,7 +30,9 @@ from utils.mongo_backend import (
 VIOLATION_TAGS = ["no_helmet", "triple_riding", "signal_jump", "phone_driving"]
 BOX_CLASSES = ["plate", "bike", "rider_head", "rider_hand", "traffic_signal"]
 
+DEFAULT_DATASET_ROOT = "frames_out"
 DEFAULT_ANNOTATOR = "user1"
+
 FILTER_MODES = ["All", "Unlabeled", "Done", "Skipped", "Unclear", "Positive-only"]
 
 
@@ -37,12 +43,16 @@ def now_iso() -> str:
 def init_session():
     if "page" not in st.session_state:
         st.session_state.page = "selector"  # selector | labeling
+    if "dataset_root" not in st.session_state:
+        st.session_state.dataset_root = DEFAULT_DATASET_ROOT
     if "video_folder" not in st.session_state:
         st.session_state.video_folder = None
     if "annotator" not in st.session_state:
         st.session_state.annotator = DEFAULT_ANNOTATOR
 
-    # Clips cache in session (from Mongo)
+    # Index / clips cache in session
+    if "index_data" not in st.session_state:
+        st.session_state.index_data = None
     if "clips" not in st.session_state:
         st.session_state.clips = None
 
@@ -77,23 +87,40 @@ def init_session():
         st.session_state.keyboard_last = ""
 
 
+def get_video_paths(dataset_root: str, video_folder: str) -> Dict[str, str]:
+    frames_dir = os.path.join(dataset_root, video_folder)
+    ann_dir = ensure_video_annotation_dir(video_folder)
+    return {"frames_dir": frames_dir, "ann_dir": ann_dir}
+
+
 def load_project(video_folder: str):
-    db = get_db()
-    ensure_indexes(db)
+    dataset_root = st.session_state.dataset_root
+    paths = get_video_paths(dataset_root, video_folder)
 
-    clips = load_clips(db, video_folder)  # expects clip docs with frames + frame_files
-    ann_map = load_annotations_map(db, video_folder)
-    state = load_state(db, video_folder)
+    # Build/load dedupe index
+    index_data = build_or_load_index(
+        frames_dir=paths["frames_dir"],
+        ann_dir=paths["ann_dir"],
+        dhash_threshold=6,
+    )
+    clips = build_clips_from_index(index_data, clip_len=4)
 
+    # Load latest annotations + state
+    ann_map = load_latest_annotations_map(paths["ann_dir"])
+    state = load_state(paths["ann_dir"])
+
+    # Restore cursor
     clip_idx = state.get("cursor_clip_idx", 0)
     clip_idx = max(0, min(clip_idx, max(0, len(clips) - 1)))
 
     st.session_state.video_folder = video_folder
+    st.session_state.index_data = index_data
     st.session_state.clips = clips
     st.session_state.ann_map = ann_map
     st.session_state.clip_idx = clip_idx
     st.session_state.filter_mode = state.get("filter_mode", "All")
 
+    # Load current clip into UI
     load_clip_into_ui()
 
 
@@ -102,32 +129,31 @@ def load_clip_into_ui():
     video_folder = st.session_state.video_folder
     if not video_folder:
         return
+
     clips = st.session_state.clips
     if not clips:
         return
 
-    clip_idx = max(0, min(st.session_state.clip_idx, len(clips) - 1))
+    clip_idx = st.session_state.clip_idx
+    clip_idx = max(0, min(clip_idx, len(clips) - 1))
     clip = clips[clip_idx]
     clip_id = clip["clip_id"]
 
     rec = st.session_state.ann_map.get(clip_id)
 
-    # Use filenames for annotation 'frame' keys
-    frame_files = clip.get("frame_files") or clip.get("frames_files") or []
-    if not frame_files:
-        # fallback: if ingest didn't store frame_files, use placeholder names
-        frame_files = [f"frame_{i:06d}.jpg" for i in range(len(clip.get("frames", [])))]
-
+    # default values
     st.session_state.tags = []
     st.session_state.review_status = "unlabeled"
     st.session_state.canvas_boxes = []
-
-    # pick default keyframe index
-    st.session_state.key_frame_idx = min(1, len(frame_files) - 1) if len(frame_files) > 1 else 0
+    st.session_state.key_frame_idx = min(1, len(clip["frames"]) - 1) if len(clip["frames"]) > 1 else 0
 
     if rec:
         st.session_state.tags = rec.get("tags", [])
         st.session_state.review_status = rec.get("review_status", "unlabeled")
+
+        # Boxes: store only those for the currently selected key frame by default
+        # We'll reload boxes for the selected key frame when key frame changes.
+        # Here, just initialize from first frame in clip (or empty), then refresh.
         st.session_state.canvas_boxes = []
         st.session_state.key_frame_idx = rec.get("key_frame_idx", st.session_state.key_frame_idx)
 
@@ -142,10 +168,9 @@ def refresh_boxes_for_key_frame():
         return
     clip = clips[st.session_state.clip_idx]
     clip_id = clip["clip_id"]
-
-    frame_files = clip.get("frame_files") or []
-    k = max(0, min(st.session_state.key_frame_idx, len(frame_files) - 1))
-    key_frame_name = frame_files[k] if frame_files else ""
+    frames = clip["frames"]
+    k = max(0, min(st.session_state.key_frame_idx, len(frames) - 1))
+    key_frame = frames[k]
 
     rec = st.session_state.ann_map.get(clip_id)
     if not rec:
@@ -154,7 +179,7 @@ def refresh_boxes_for_key_frame():
         return
 
     boxes = rec.get("boxes", [])
-    boxes_k = [b for b in boxes if b.get("frame") == key_frame_name]
+    boxes_k = [b for b in boxes if b.get("frame") == key_frame]
     st.session_state.canvas_boxes = boxes_k
     st.session_state.last_canvas_hash = json.dumps(boxes_k, sort_keys=True)
 
@@ -167,15 +192,14 @@ def clip_record_from_ui() -> Dict[str, Any]:
     video_id = st.session_state.video_folder
     clip = current_clip()
     clip_id = clip["clip_id"]
-
-    frame_files = clip.get("frame_files") or []
-    k = max(0, min(st.session_state.key_frame_idx, len(frame_files) - 1))
-    key_frame_name = frame_files[k] if frame_files else ""
+    frames = clip["frames"]
+    k = max(0, min(st.session_state.key_frame_idx, len(frames) - 1))
+    key_frame = frames[k]
 
     # Merge: keep other frames' boxes from existing record (if any), but replace key_frame boxes from UI
     existing = st.session_state.ann_map.get(clip_id, {})
     existing_boxes = existing.get("boxes", [])
-    other_boxes = [b for b in existing_boxes if b.get("frame") != key_frame_name]
+    other_boxes = [b for b in existing_boxes if b.get("frame") != key_frame]
 
     ui_boxes = st.session_state.canvas_boxes or []
     merged_boxes = other_boxes + ui_boxes
@@ -183,46 +207,49 @@ def clip_record_from_ui() -> Dict[str, Any]:
     rec = {
         "video_id": video_id,
         "clip_id": clip_id,
-        "frames": frame_files,
+        "frames": frames,
         "tags": sorted(list(set(st.session_state.tags))),
         "boxes": merged_boxes,
         "review_status": st.session_state.review_status,
         "annotator": st.session_state.annotator,
         "updated_at": now_iso(),
+        # helpful extra (not required but harmless)
         "key_frame_idx": k,
-        "key_frame": key_frame_name,
+        "key_frame": key_frame,
     }
     return rec
 
 
 def autosave_annotation():
-    """Upsert record to Mongo and update ann_map (latest wins)."""
+    """Append record to JSONL and update ann_map (latest wins)."""
     if not st.session_state.video_folder:
         return
 
-    db = get_db()
+    paths = get_video_paths(st.session_state.dataset_root, st.session_state.video_folder)
     rec = clip_record_from_ui()
 
-    upsert_annotation(db, rec)
+    append_annotation_record(paths["ann_dir"], rec)
     st.session_state.ann_map[rec["clip_id"]] = rec
 
+    # Update state cursor
     autosave_state_only()
 
 
 def autosave_state_only():
     if not st.session_state.video_folder:
         return
-    db = get_db()
+    paths = get_video_paths(st.session_state.dataset_root, st.session_state.video_folder)
 
     counts = compute_progress_counts(st.session_state.clips, st.session_state.ann_map)
     state = {
         "video_id": st.session_state.video_folder,
+        "dataset_root": st.session_state.dataset_root,
         "cursor_clip_idx": int(st.session_state.clip_idx),
         "filter_mode": st.session_state.filter_mode,
         "updated_at": now_iso(),
         "counts": counts,
     }
-    save_state(db, st.session_state.video_folder, state)
+    save_state(paths["ann_dir"], state)
 
 
 def set_status(status: str):
@@ -230,16 +257,8 @@ def set_status(status: str):
     autosave_annotation()
 
 
-def clear_tags_toggleboxes():
-    # keep sidebar checkboxes in sync when clearing via button
-    for t in VIOLATION_TAGS:
-        if f"tag_{t}" in st.session_state:
-            st.session_state[f"tag_{t}"] = False
-
-
 def clear_tags():
     st.session_state.tags = []
-    clear_tags_toggleboxes()
     autosave_annotation()
 
 
@@ -263,7 +282,6 @@ def copy_boxes_from_previous_clip():
     idx = st.session_state.clip_idx
     if idx <= 0:
         return
-
     prev_clip = clips[idx - 1]
     prev_id = prev_clip["clip_id"]
     prev_rec = st.session_state.ann_map.get(prev_id)
@@ -271,10 +289,11 @@ def copy_boxes_from_previous_clip():
         return
 
     cur = current_clip()
-    cur_frame_files = cur.get("frame_files") or []
-    k = max(0, min(st.session_state.key_frame_idx, len(cur_frame_files) - 1))
-    key_frame_name = cur_frame_files[k] if cur_frame_files else ""
+    frames = cur["frames"]
+    k = max(0, min(st.session_state.key_frame_idx, len(frames) - 1))
+    key_frame = frames[k]
 
+    # Copy boxes from prev record's key_frame if present; else copy all boxes from prev and attach to current key frame
     prev_key = prev_rec.get("key_frame")
     prev_boxes = prev_rec.get("boxes", [])
     if prev_key:
@@ -286,7 +305,7 @@ def copy_boxes_from_previous_clip():
     for b in src:
         copied.append(
             {
-                "frame": key_frame_name,
+                "frame": key_frame,
                 "label": b.get("label", BOX_CLASSES[0]),
                 "x": float(b.get("x", 0.5)),
                 "y": float(b.get("y", 0.5)),
@@ -300,18 +319,16 @@ def copy_boxes_from_previous_clip():
 
 
 def propagate_boxes_to_all_frames_in_clip():
-    """Optional helper: duplicate current keyframe boxes to all frames in clip (by filename keys)."""
+    """Optional helper: duplicate current keyframe boxes to all frames in clip."""
     cur = current_clip()
-    frame_files = cur.get("frame_files") or []
-    if not frame_files:
-        return
-
-    k = max(0, min(st.session_state.key_frame_idx, len(frame_files) - 1))
-    key_frame_name = frame_files[k]
+    frames = cur["frames"]
+    k = max(0, min(st.session_state.key_frame_idx, len(frames) - 1))
+    key_frame = frames[k]
     ui_boxes = st.session_state.canvas_boxes or []
 
+    # Create per-frame boxes
     all_boxes = []
-    for f in frame_files:
+    for f in frames:
         for b in ui_boxes:
             all_boxes.append(
                 {
@@ -324,12 +341,20 @@ def propagate_boxes_to_all_frames_in_clip():
                 }
             )
 
+    # Replace all frames boxes in record
     clip_id = cur["clip_id"]
     rec = st.session_state.ann_map.get(clip_id, {})
     rec_boxes_existing = rec.get("boxes", [])
-    rec_boxes_nonclip = [b for b in rec_boxes_existing if b.get("frame") not in frame_files]
-    st.session_state.ann_map[clip_id] = {**clip_record_from_ui(), "boxes": rec_boxes_nonclip + all_boxes, "key_frame": key_frame_name}
+    rec_boxes_nonclip = [b for b in rec_boxes_existing if b.get("frame") not in frames]
+    st.session_state.ann_map[clip_id] = {**clip_record_from_ui(), "boxes": rec_boxes_nonclip + all_boxes}
     autosave_annotation()
+
+
+def move_cursor(delta: int):
+    clips = st.session_state.clips
+    n = len(clips)
+    st.session_state.clip_idx = max(0, min(st.session_state.clip_idx + delta, n - 1))
+    load_clip_into_ui()
 
 
 def move_next_filtered(delta: int):
@@ -398,6 +423,7 @@ def normalize_box_from_canvas(obj: Dict[str, Any], img_w: int, img_h: int) -> Op
     nw = w / img_w
     nh = h / img_h
 
+    # clamp
     cx = max(0.0, min(1.0, cx))
     cy = max(0.0, min(1.0, cy))
     nw = max(0.0, min(1.0, nw))
@@ -407,14 +433,19 @@ def normalize_box_from_canvas(obj: Dict[str, Any], img_w: int, img_h: int) -> Op
 
 def ui_selector_page():
     st.title("Traffic Violation Labeler — Phase-1")
+
     st.subheader("Project / Video selector")
 
-    db = get_db()
-    ensure_indexes(db)
+    st.text_input("Dataset root", value=st.session_state.dataset_root, key="dataset_root")
+    dataset_root = st.session_state.dataset_root
 
-    videos = list_videos(db)
+    if not os.path.isdir(dataset_root):
+        st.warning(f"Folder not found: {dataset_root}")
+        return
+
+    videos = list_video_folders(dataset_root)
     if not videos:
-        st.info("No videos found in MongoDB. Ingest first.")
+        st.info("No video folders found under dataset root.")
         return
 
     video = st.selectbox("Pick a video folder", options=videos)
@@ -423,23 +454,26 @@ def ui_selector_page():
     if st.button("Load project stats"):
         load_project(video)
 
-    if st.session_state.video_folder == video and st.session_state.clips:
-        stats = get_video_stats(db, video)
+    if st.session_state.video_folder == video and st.session_state.index_data and st.session_state.clips:
+        paths = get_video_paths(dataset_root, video)
+        state = load_state(paths["ann_dir"])
         ann_map = st.session_state.ann_map
         clips = st.session_state.clips
 
         counts = compute_progress_counts(clips, ann_map)
         last_idx = get_last_labeled_clip_idx(clips, ann_map)
 
+        total_frames = len(st.session_state.index_data["kept_frames"])
         st.markdown("### Stats")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total clips", stats["total_clips"])
+        c1.metric("Total (kept frames)", total_frames)
         c2.metric("Done", counts["done"])
         c3.metric("Skipped", counts["skipped"])
         c4.metric("Unclear", counts["unclear"])
 
+        st.write(f"**Total clips:** {len(clips)}")
         st.write(f"**Last labeled clip index:** {last_idx if last_idx is not None else '—'}")
-        st.write(f"**Resume cursor (clip_idx):** {stats['cursor_clip_idx']}")
+        st.write(f"**Resume cursor (clip_idx):** {state.get('cursor_clip_idx', 0)}")
 
         if st.button("Start / Resume labeling"):
             st.session_state.page = "labeling"
@@ -466,6 +500,7 @@ def ui_keyboard_shortcuts():
         return
     st.session_state.keyboard_last = key
 
+    # Required mappings
     if key == "A":
         move_next_filtered(-1)
         st.rerun()
@@ -507,6 +542,7 @@ def ui_labeling_page():
     idx = st.session_state.clip_idx
     n = len(clips)
 
+    # Top bar
     counts = compute_progress_counts(clips, ann_map)
     remaining = n - (counts["done"] + counts["skipped"] + counts["unclear"])
     done_total = counts["done"] + counts["skipped"] + counts["unclear"]
@@ -516,19 +552,24 @@ def ui_labeling_page():
     st.write(f"**Video:** `{video}`  |  **Clip:** `{idx}/{n-1}`  |  **Progress:** {done_total}/{n}")
     st.progress(progress)
 
+    # Keyboard shortcuts hook (must-have)
     ui_keyboard_shortcuts()
 
+    # Sidebar
     with st.sidebar:
         st.header("Tags (clip-level)")
-
+        # Render tag checkboxes with autosave on change
         def _on_tag_change():
+            # build tags from checkbox states
             tags = []
             for t in VIOLATION_TAGS:
                 if st.session_state.get(f"tag_{t}", False):
                     tags.append(t)
             st.session_state.tags = tags
+            # If tags exist, don't force done; user chooses status. Just autosave.
             autosave_annotation()
 
+        # Initialize checkbox values from session tags
         tags_set = set(st.session_state.tags)
         for t in VIOLATION_TAGS:
             st.checkbox(t, key=f"tag_{t}", value=(t in tags_set), on_change=_on_tag_change)
@@ -607,49 +648,36 @@ def ui_labeling_page():
 
     # Main area
     clip = clips[idx]
+    frames = clip["frames"]
 
-    # IMPORTANT:
-    # - frame_files = filenames for annotation keys ("frame": "frame_000140.jpg")
-    # - frame_ids   = GridFS file ids used to fetch image bytes
-    frame_files = clip.get("frame_files") or []
-    frame_ids = clip.get("frames") or []
-
-    if not frame_files and frame_ids:
-        frame_files = [f"frame_{i:06d}.jpg" for i in range(len(frame_ids))]
-
-    if not frame_ids or not frame_files or len(frame_ids) != len(frame_files):
-        st.error("Clip document is missing expected fields. Expected: frame_files(list[str]) and frames(list[gridfs_id]) of same length.")
-        st.stop()
-
-    st.subheader(f"Clip {clip['clip_id']} — {len(frame_files)} frames")
-    cols = st.columns(len(frame_files))
-    for j, fname in enumerate(frame_files):
-        frame_id = frame_ids[j]
-        img = load_frame_image_cached(video_id=video, frame_id=frame_id, max_w=220)
+    # Mini strip / key frame selector
+    st.subheader(f"Clip {clip['clip_id']} — {len(frames)} frames")
+    cols = st.columns(len(frames))
+    for j, f in enumerate(frames):
+        img_path = os.path.join(st.session_state.dataset_root, video, f)
+        img = load_image_cached(img_path, max_w=220)
         with cols[j]:
-            st.image(img, caption=f"{j}: {fname}", use_container_width=True)
+            st.image(img, caption=f"{j}: {f}", use_container_width=True)
 
-    k = st.slider(
-        "Select key frame for boxes",
-        min_value=0,
-        max_value=len(frame_files) - 1,
-        value=st.session_state.key_frame_idx,
-    )
+    k = st.slider("Select key frame for boxes", min_value=0, max_value=len(frames) - 1, value=st.session_state.key_frame_idx)
     if k != st.session_state.key_frame_idx:
         st.session_state.key_frame_idx = k
         refresh_boxes_for_key_frame()
         autosave_state_only()
 
-    key_frame_name = frame_files[st.session_state.key_frame_idx]
-    key_frame_id = frame_ids[st.session_state.key_frame_idx]
-    img = load_frame_image_cached(video_id=video, frame_id=key_frame_id, max_w=1100)
+    key_frame = frames[st.session_state.key_frame_idx]
+    key_path = os.path.join(st.session_state.dataset_root, video, key_frame)
+    img = load_image_cached(key_path, max_w=1100)
     img_w, img_h = img.size
 
     st.markdown("### Draw boxes (key frame)")
     st.caption("Boxes are saved as normalized YOLO-style center coords: x,y,w,h (0–1).")
 
+    # Build initial drawing objects from existing boxes (convert back to pixel rect)
+    # NOTE: drawable-canvas expects pixel rect with left/top/width/height.
     initial_objects = []
     for b in st.session_state.canvas_boxes:
+        # convert center-normalized -> pixel top-left
         cx, cy, bw, bh = b["x"], b["y"], b["w"], b["h"]
         wpx = bw * img_w
         hpx = bh * img_h
@@ -678,9 +706,11 @@ def ui_labeling_page():
         width=img_w,
         drawing_mode="rect",
         initial_drawing={"version": "4.4.0", "objects": initial_objects},
-        key=f"canvas_{video}_{clip['clip_id']}_{key_frame_name}",
+        key=f"canvas_{video}_{clip['clip_id']}_{key_frame}",
     )
 
+    # Convert canvas rects -> normalized boxes, and preserve labels using a stable order
+    # We keep labels in session_state.canvas_boxes (by index). If object count changes, default to "plate".
     new_boxes = []
     objects = (canvas_result.json_data or {}).get("objects", []) if canvas_result else []
     for i_obj, obj in enumerate(objects):
@@ -690,8 +720,9 @@ def ui_labeling_page():
         label = BOX_CLASSES[0]
         if i_obj < len(st.session_state.canvas_boxes):
             label = st.session_state.canvas_boxes[i_obj].get("label", BOX_CLASSES[0])
-        new_boxes.append({"frame": key_frame_name, "label": label, **nb})
+        new_boxes.append({"frame": key_frame, "label": label, **nb})
 
+    # Autosave on box change
     new_hash = json.dumps(new_boxes, sort_keys=True)
     if new_hash != st.session_state.last_canvas_hash:
         st.session_state.canvas_boxes = new_boxes
@@ -711,7 +742,7 @@ def ui_labeling_page():
                     "Class",
                     BOX_CLASSES,
                     index=BOX_CLASSES.index(b["label"]) if b["label"] in BOX_CLASSES else 0,
-                    key=f"boxlabel_{clip['clip_id']}_{key_frame_name}_{i_b}",
+                    key=f"boxlabel_{clip['clip_id']}_{key_frame}_{i_b}",
                 )
                 if new_label != b["label"]:
                     st.session_state.canvas_boxes[i_b]["label"] = new_label
@@ -720,6 +751,7 @@ def ui_labeling_page():
             with c3:
                 st.write(f"{b['frame']} | x={b['x']:.3f}, y={b['y']:.3f}, w={b['w']:.3f}, h={b['h']:.3f}")
 
+    # Pass-1 triage helpers
     st.divider()
     st.subheader("Pass-1 triage helpers")
     ctri1, ctri2, ctri3 = st.columns(3)
@@ -727,6 +759,7 @@ def ui_labeling_page():
         clear_tags()
         st.toast("No violation set (tags cleared)", icon="✅")
     if ctri2.button("Mark Done (triage)"):
+        # If no tags, done still allowed as "no violation" clip
         set_status("done")
         st.toast("Marked done", icon="✅")
     if ctri3.button("Skip (blur)"):
