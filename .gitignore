@@ -1,0 +1,15 @@
+# Ignore generated data
+downloads/
+frames_out/
+logs/
+
+# Ignore virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+Thumbs.db
