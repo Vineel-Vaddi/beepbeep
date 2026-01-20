@@ -5,6 +5,14 @@ from PIL import Image
 
 import streamlit as st
 
+# --- Streamlit cache compatibility ---
+# streamlit >= 1.18: st.cache_data
+# streamlit older: st.cache
+if hasattr(st, "cache_data"):
+    _cache = st.cache_data
+else:
+    _cache = st.cache
+
 
 def list_video_folders(dataset_root: str) -> List[str]:
     out = []
@@ -126,7 +134,7 @@ def get_clip_frames(clips: List[Dict[str, Any]], clip_idx: int) -> List[str]:
     return clips[clip_idx]["frames"]
 
 
-@st.cache_data(show_spinner=False)
+@_cache(show_spinner=False)
 def load_image_cached(path: str, max_w: int = 1100) -> Image.Image:
     """
     Cached image load + optional downscale for speed.

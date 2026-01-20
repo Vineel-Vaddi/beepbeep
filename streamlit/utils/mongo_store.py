@@ -22,16 +22,23 @@ def ensure_indexes(db):
     db.frames_fs.files.create_index([("metadata.video_id", ASCENDING)])
     db.frames_fs.files.create_index([("metadata.video_id", ASCENDING), ("metadata.filename", ASCENDING)], unique=True)
 
-def put_frame_bytes(fs, jpg_bytes: bytes, filename: str, metadata: Dict[str, Any]) -> str:
+def put_frame_bytes(fs, jpg_bytes: bytes, filename: str, metadata: Dict[str, Any]):
     """
-    Returns GridFS file_id as string.
+    Returns GridFS file_id as ObjectId (recommended).
+    Store ObjectId in Mongo fields; convert to str only for printing.
     """
     file_id = fs.put(jpg_bytes, filename=filename, metadata=metadata)
-    return str(file_id)
+    return file_id
 
-def find_frame_file(fs, db, video_id: str, filename: str) -> Optional[str]:
+
+def find_frame_file(fs, db, video_id: str, filename: str):
     """
     Check if frame exists in GridFS already.
+    Returns ObjectId if found else None.
     """
-    doc = db.frames_fs.files.find_one({"metadata.video_id": video_id, "metadata.filename": filename}, {"_id": 1})
-    return str(doc["_id"]) if doc else None
+    doc = db.frames_fs.files.find_one(
+        {"metadata.video_id": video_id, "metadata.filename": filename},
+        {"_id": 1}
+    )
+    return doc["_id"] if doc else None
+
