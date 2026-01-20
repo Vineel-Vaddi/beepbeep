@@ -31,8 +31,19 @@ from utils.mongo_backend import (
 VIOLATION_TAGS = ["no_helmet", "triple_riding", "signal_jump", "phone_driving"]
 BOX_CLASSES = ["plate", "bike", "rider_head", "rider_hand", "traffic_signal"]
 
+# Color per box class (RGBA with transparency)
+BOX_CLASS_STYLE = {
+    "plate": "rgba(255, 215, 0, 0.25)",          # gold
+    "bike": "rgba(0, 176, 246, 0.25)",           # blue
+    "rider_head": "rgba(0, 200, 83, 0.25)",      # green
+    "rider_hand": "rgba(255, 87, 34, 0.25)",     # orange
+    "traffic_signal": "rgba(156, 39, 176, 0.25)" # purple
+}
+
+
 DEFAULT_ANNOTATOR = "user1"
-FILTER_MODES = ["All", "Unlabeled", "Done", "Skipped", "Unclear", "Positive-only"]
+FILTER_MODES = ["All", "Needs Triage", "Needs Tags", "Needs Boxes", "Complete", "Has Violations"]
+
 
 
 def now_iso() -> str:
@@ -40,46 +51,46 @@ def now_iso() -> str:
 
 
 def init_session():
-    if "page" not in st.session_state:
-        st.session_state.page = "selector"  # selector | labeling
-    if "video_folder" not in st.session_state:
-        st.session_state.video_folder = None
-    if "annotator" not in st.session_state:
-        st.session_state.annotator = DEFAULT_ANNOTATOR
+    # Always create all keys (callbacks may fire early on rerun)
+    defaults = {
+        "page": "selector",                 # selector | labeling
+        "video_folder": None,
+        "annotator": DEFAULT_ANNOTATOR,
 
-    # Clips cache in session (from Mongo)
-    if "clips" not in st.session_state:
-        st.session_state.clips = None
+        "clips": None,
+        "ann_map": {},
 
-    # Annotations map (latest per clip_id)
-    if "ann_map" not in st.session_state:
-        st.session_state.ann_map = {}
+        "clip_idx": 0,
 
-    # Cursor
-    if "clip_idx" not in st.session_state:
-        st.session_state.clip_idx = 0
+        "filter_mode": "All",
+        "jump_to": 0,
 
-    # UI state
-    if "filter_mode" not in st.session_state:
-        st.session_state.filter_mode = "All"
-    if "jump_to" not in st.session_state:
-        st.session_state.jump_to = 0
-    if "key_frame_idx" not in st.session_state:
-        st.session_state.key_frame_idx = 0  # within clip
+        # Selected working frame inside the clip
+        "frame_idx": 0,
 
-    # Canvas persistence
-    if "canvas_boxes" not in st.session_state:
-        st.session_state.canvas_boxes = []  # list of dicts in schema format
-    if "last_canvas_hash" not in st.session_state:
-        st.session_state.last_canvas_hash = ""
+        # Current frame boxes (only boxes for selected frame)
+        "canvas_boxes": [],
+        "last_canvas_hash": "",
 
-    if "tags" not in st.session_state:
-        st.session_state.tags = []
-    if "review_status" not in st.session_state:
-        st.session_state.review_status = "unlabeled"  # done|skipped|unclear|unlabeled
+        # Frame-level maps for current clip (loaded from Mongo)
+        "frame_status_map": {},   # {frame_file: usable|discarded|unclear|done}
+        "frame_tags_map": {},     # {frame_file: [tags...]}
 
-    if "keyboard_last" not in st.session_state:
-        st.session_state.keyboard_last = ""
+        # Plotly persistence
+        "plotly_fig_state": {},
+
+        # UX helpers
+        "active_box_class": BOX_CLASSES[0],
+
+        "keyboard_last": "",
+
+    }
+
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
 
 
 def load_project(video_folder: str):
@@ -103,7 +114,7 @@ def load_project(video_folder: str):
 
 
 def load_clip_into_ui():
-    """Populate UI fields (tags/status/boxes) from ann_map for current clip."""
+    """Load frame-level triage/tags and current frame boxes for selected frame."""
     video_folder = st.session_state.video_folder
     if not video_folder:
         return
@@ -115,53 +126,67 @@ def load_clip_into_ui():
     clip = clips[clip_idx]
     clip_id = clip["clip_id"]
 
-    rec = st.session_state.ann_map.get(clip_id)
+    rec = st.session_state.ann_map.get(clip_id, {}) or {}
 
-    # Use filenames for annotation 'frame' keys
     frame_files = clip.get("frame_files") or clip.get("frames_files") or []
     if not frame_files:
-        # fallback: if ingest didn't store frame_files, use placeholder names
-        frame_files = [f"frame_{i:06d}.jpg" for i in range(len(clip.get("frames", [])))]
+        frame_files = [f"frame_{i:06d}.jpg" for i in range(len(clip.get("frames", []) or []))]
 
-    st.session_state.tags = []
-    st.session_state.review_status = "unlabeled"
-    st.session_state.canvas_boxes = []
+    # IMPORTANT: copy so we don't mutate ann_map objects accidentally
+    frame_status_map = dict(rec.get("frame_status_map") or {})
+    frame_tags_map = dict(rec.get("frame_tags_map") or {})
 
-    # pick default keyframe index
-    st.session_state.key_frame_idx = min(1, len(frame_files) - 1) if len(frame_files) > 1 else 0
+    # Ensure every frame has keys
+    for f in frame_files:
+        frame_status_map.setdefault(f, "untriaged")  # default: untriaged
+        frame_tags_map.setdefault(f, [])             # default: no tags
 
-    if rec:
-        st.session_state.tags = rec.get("tags", [])
-        st.session_state.review_status = rec.get("review_status", "unlabeled")
-        st.session_state.canvas_boxes = []
-        st.session_state.key_frame_idx = rec.get("key_frame_idx", st.session_state.key_frame_idx)
+    st.session_state.frame_status_map = frame_status_map
+    st.session_state.frame_tags_map = frame_tags_map
 
-    refresh_boxes_for_key_frame()
+    # Pick default frame_idx (triage-first)
+    prev_idx = int(st.session_state.get("frame_idx", 0))
+    if 0 <= prev_idx < len(frame_files):
+        st.session_state.frame_idx = prev_idx
+    else:
+        untriaged_idxs = [i for i, f in enumerate(frame_files) if frame_status_map.get(f) == "untriaged"]
+        usable_idxs = [i for i, f in enumerate(frame_files) if frame_status_map.get(f) == "usable"]
+        st.session_state.frame_idx = untriaged_idxs[0] if untriaged_idxs else (usable_idxs[0] if usable_idxs else 0)
+
+    refresh_boxes_for_selected_frame()
     autosave_state_only()
 
 
-def refresh_boxes_for_key_frame():
-    """Load boxes from ann_map for current clip & selected key frame into session_state.canvas_boxes."""
+
+def refresh_boxes_for_selected_frame():
+    """Load boxes for current clip & selected frame into session_state.canvas_boxes."""
     clips = st.session_state.clips
     if not clips:
         return
+
     clip = clips[st.session_state.clip_idx]
     clip_id = clip["clip_id"]
 
-    frame_files = clip.get("frame_files") or []
-    k = max(0, min(st.session_state.key_frame_idx, len(frame_files) - 1))
-    key_frame_name = frame_files[k] if frame_files else ""
+    frame_files = clip.get("frame_files") or clip.get("frames_files") or []
+    if not frame_files:
+        frame_files = [f"frame_{i:06d}.jpg" for i in range(len(clip.get("frames", []) or []))]
 
-    rec = st.session_state.ann_map.get(clip_id)
-    if not rec:
+    if not frame_files:
         st.session_state.canvas_boxes = []
         st.session_state.last_canvas_hash = ""
         return
 
-    boxes = rec.get("boxes", [])
-    boxes_k = [b for b in boxes if b.get("frame") == key_frame_name]
-    st.session_state.canvas_boxes = boxes_k
-    st.session_state.last_canvas_hash = json.dumps(boxes_k, sort_keys=True)
+    i = int(st.session_state.get("frame_idx", 0))
+    i = max(0, min(i, len(frame_files) - 1))
+    frame_name = frame_files[i]
+
+    rec = st.session_state.ann_map.get(clip_id, {}) or {}
+    boxes = rec.get("boxes", []) or []
+
+    boxes_f = [b for b in boxes if b.get("frame") == frame_name]
+
+    st.session_state.canvas_boxes = boxes_f
+    st.session_state.last_canvas_hash = json.dumps(boxes_f, sort_keys=True)
 
 
 def current_clip() -> Dict[str, Any]:
@@ -173,31 +198,99 @@ def clip_record_from_ui() -> Dict[str, Any]:
     clip = current_clip()
     clip_id = clip["clip_id"]
 
-    frame_files = clip.get("frame_files") or []
-    k = max(0, min(st.session_state.key_frame_idx, len(frame_files) - 1))
-    key_frame_name = frame_files[k] if frame_files else ""
+    # Frame filenames used as stable keys everywhere
+    frame_files = clip.get("frame_files") or clip.get("frames_files") or []
+    if not frame_files:
+        frame_files = [f"frame_{i:06d}.jpg" for i in range(len(clip.get("frames", [])) or [])]
 
-    # Merge: keep other frames' boxes from existing record (if any), but replace key_frame boxes from UI
+    # Current selected frame in UI
+    i = int(st.session_state.get("frame_idx", 0))
+    i = max(0, min(i, max(0, len(frame_files) - 1)))
+    frame_name = frame_files[i] if frame_files else ""
+
     existing = st.session_state.ann_map.get(clip_id, {})
-    existing_boxes = existing.get("boxes", [])
-    other_boxes = [b for b in existing_boxes if b.get("frame") != key_frame_name]
+    existing_boxes = existing.get("boxes", []) or []
 
+    # Replace boxes only for selected frame; keep boxes for other frames
+    other_boxes = [b for b in existing_boxes if b.get("frame") != frame_name]
     ui_boxes = st.session_state.canvas_boxes or []
     merged_boxes = other_boxes + ui_boxes
+
+    # Frame-level maps (must be stored for YOLO export)
+    frame_status_map = dict(st.session_state.get("frame_status_map") or {})
+    frame_tags_map = dict(st.session_state.get("frame_tags_map") or {})
+
+    # Ensure keys exist for every frame (sanity)
+    # Recommended default: "untriaged" (NOT "usable")
+    for f in frame_files:
+        frame_status_map.setdefault(f, "untriaged")
+        frame_tags_map.setdefault(f, [])
+
+    # --- Derived helpers for filtering/progress ---
+    usable_frames = [f for f in frame_files if frame_status_map.get(f) == "usable"]
+
+    # union tags across usable frames (optional clip summary)
+    all_tags = []
+    for f in usable_frames:
+        all_tags.extend(frame_tags_map.get(f, []) or [])
+    clip_tags_union = sorted(set(all_tags))
+
+    # boxes by frame for "needs boxes" logic
+    boxes_by_frame = {}
+    for b in merged_boxes:
+        fn = b.get("frame")
+        if fn:
+            boxes_by_frame.setdefault(fn, []).append(b)
+
+    def frame_needs_boxes(f: str) -> bool:
+        # policy: if a frame has tags, it *may* need boxes.
+        # If you want "only some tags require localization", add gating here.
+        has_tags = len(frame_tags_map.get(f, []) or []) > 0
+        has_boxes = len(boxes_by_frame.get(f, []) or []) > 0
+        return has_tags and (not has_boxes)
+
+    needs_triage = any(frame_status_map.get(f) == "untriaged" for f in frame_files)
+    needs_tags = any((frame_status_map.get(f) == "usable") and (len(frame_tags_map.get(f, []) or []) == 0) for f in frame_files)
+    needs_boxes = any((frame_status_map.get(f) == "usable") and frame_needs_boxes(f) for f in frame_files)
+
+    # Derived review_status (used by compute_progress_counts)
+    # Keep your labels: done/skipped/unclear/unlabeled
+    if needs_triage or needs_tags or needs_boxes:
+        review_status = "unlabeled"
+    else:
+        # If no usable frames, treat as skipped (everything discarded/unclear)
+        if len(usable_frames) == 0:
+            review_status = "skipped"
+        else:
+            review_status = "done"
 
     rec = {
         "video_id": video_id,
         "clip_id": clip_id,
+
+        # keep frames list for reference/debug/export
         "frames": frame_files,
-        "tags": sorted(list(set(st.session_state.tags))),
+
+        # NEW (required for your Stage-A workflow + YOLO export)
+        "frame_status_map": frame_status_map,
+        "frame_tags_map": frame_tags_map,
+
+        # boxes are stored per frame (each box includes "frame": "<frame_file>")
         "boxes": merged_boxes,
-        "review_status": st.session_state.review_status,
-        "annotator": st.session_state.annotator,
+
+        # Optional clip summary (useful for quick filtering/search)
+        "tags": clip_tags_union,
+        "review_status": review_status,
+
+        "annotator": st.session_state.get("annotator", DEFAULT_ANNOTATOR),
         "updated_at": now_iso(),
-        "key_frame_idx": k,
-        "key_frame": key_frame_name,
+
+        # helpful cursor info
+        "selected_frame_idx": i,
+        "selected_frame": frame_name,
     }
     return rec
+
 
 
 def autosave_annotation():
@@ -277,21 +370,26 @@ def copy_boxes_from_previous_clip():
 
     cur = current_clip()
     cur_frame_files = cur.get("frame_files") or []
-    k = max(0, min(st.session_state.key_frame_idx, len(cur_frame_files) - 1))
-    key_frame_name = cur_frame_files[k] if cur_frame_files else ""
+    if not cur_frame_files:
+        cur_frame_files = [f"frame_{i:06d}.jpg" for i in range(len(cur.get("frames", [])))]
 
-    prev_key = prev_rec.get("key_frame")
+    i = max(0, min(st.session_state.frame_idx, len(cur_frame_files) - 1))
+    frame_name = cur_frame_files[i]
+
+    # Source frame from previous record (selected_frame if available)
+    src_frame = prev_rec.get("selected_frame")
     prev_boxes = prev_rec.get("boxes", [])
-    if prev_key:
-        src = [b for b in prev_boxes if b.get("frame") == prev_key]
+
+    if src_frame:
+        src = [b for b in prev_boxes if b.get("frame") == src_frame]
     else:
-        src = prev_boxes[:]
+        src = prev_boxes[:]  # fallback
 
     copied = []
     for b in src:
         copied.append(
             {
-                "frame": key_frame_name,
+                "frame": frame_name,
                 "label": b.get("label", BOX_CLASSES[0]),
                 "x": float(b.get("x", 0.5)),
                 "y": float(b.get("y", 0.5)),
@@ -304,6 +402,7 @@ def copy_boxes_from_previous_clip():
     autosave_annotation()
 
 
+
 def propagate_boxes_to_all_frames_in_clip():
     """Optional helper: duplicate current keyframe boxes to all frames in clip (by filename keys)."""
     cur = current_clip()
@@ -311,8 +410,9 @@ def propagate_boxes_to_all_frames_in_clip():
     if not frame_files:
         return
 
-    k = max(0, min(st.session_state.key_frame_idx, len(frame_files) - 1))
-    key_frame_name = frame_files[k]
+    i = max(0, min(st.session_state.frame_idx, len(frame_files) - 1))
+    frame_name = frame_files[i]
+
     ui_boxes = st.session_state.canvas_boxes or []
 
     all_boxes = []
@@ -333,7 +433,7 @@ def propagate_boxes_to_all_frames_in_clip():
     rec = st.session_state.ann_map.get(clip_id, {})
     rec_boxes_existing = rec.get("boxes", [])
     rec_boxes_nonclip = [b for b in rec_boxes_existing if b.get("frame") not in frame_files]
-    st.session_state.ann_map[clip_id] = {**clip_record_from_ui(), "boxes": rec_boxes_nonclip + all_boxes, "key_frame": key_frame_name}
+    st.session_state.ann_map[clip_id] = {**clip_record_from_ui(), "boxes": rec_boxes_nonclip + all_boxes, "selected_frame": frame_name}
     autosave_annotation()
 
 
@@ -345,21 +445,47 @@ def move_next_filtered(delta: int):
 
     def ok(i: int) -> bool:
         clip_id = clips[i]["clip_id"]
-        rec = st.session_state.ann_map.get(clip_id)
-        status = rec.get("review_status", "unlabeled") if rec else "unlabeled"
-        tags = rec.get("tags", []) if rec else []
+        rec = st.session_state.ann_map.get(clip_id, {})
+
+        frame_status_map = rec.get("frame_status_map") or {}
+        frame_tags_map = rec.get("frame_tags_map") or {}
+
+        frame_files = clips[i].get("frame_files") or []
+        if not frame_files:
+            frame_files = [f"frame_{k:06d}.jpg" for k in range(len(clips[i].get("frames", [])))]
+
+        usable_frames = [f for f in frame_files if frame_status_map.get(f, "usable") == "usable"]
+
+        # needs triage if a frame missing status key
+        needs_triage = any(f not in frame_status_map for f in frame_files)
+
+        # needs tags if any usable frame has empty tags
+        needs_tags = any(len(frame_tags_map.get(f, [])) == 0 for f in usable_frames)
+
+        # needs boxes if any usable frame has tags but has zero boxes
+        boxes = rec.get("boxes", [])
+
+        def frame_has_boxes(ff):
+            return any(b.get("frame") == ff for b in boxes)
+
+        needs_boxes = any((len(frame_tags_map.get(f, [])) > 0 and not frame_has_boxes(f)) for f in usable_frames)
+
+        has_violations = any(len(frame_tags_map.get(f, [])) > 0 for f in usable_frames)
+
+        complete = (not needs_tags) and (not needs_boxes)
+
         if mode == "All":
             return True
-        if mode == "Unlabeled":
-            return status == "unlabeled"
-        if mode == "Done":
-            return status == "done"
-        if mode == "Skipped":
-            return status == "skipped"
-        if mode == "Unclear":
-            return status == "unclear"
-        if mode == "Positive-only":
-            return len(tags) > 0
+        if mode == "Needs Triage":
+            return needs_triage
+        if mode == "Needs Tags":
+            return needs_tags
+        if mode == "Needs Boxes":
+            return needs_boxes
+        if mode == "Complete":
+            return complete
+        if mode == "Has Violations":
+            return has_violations
         return True
 
     i = st.session_state.clip_idx
@@ -372,6 +498,7 @@ def move_next_filtered(delta: int):
             st.session_state.clip_idx = i
             load_clip_into_ui()
             return
+
 
 
 def handle_jump():
@@ -388,20 +515,17 @@ def pil_to_base64_png(img: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def shapes_to_boxes(shapes, img_w: int, img_h: int, key_frame_name: str, prev_boxes=None):
+def shapes_to_boxes(shapes, img_w: int, img_h: int, key_frame_name: str, prev_boxes=None, active_class=None):
     """
     Convert Plotly rect shapes to normalized YOLO center coords.
-    shapes: fig.layout.shapes
-    prev_boxes: existing boxes list (to preserve labels by index)
+    Preserve labels by index; any NEW shape gets active_class.
     """
     prev_boxes = prev_boxes or []
     out = []
-
     if not shapes:
         return out
 
     for i, s in enumerate(shapes):
-        # Plotly stores rect bounds as x0,x1,y0,y1 in data coords (pixels here)
         x0 = float(getattr(s, "x0", 0))
         x1 = float(getattr(s, "x1", 0))
         y0 = float(getattr(s, "y0", 0))
@@ -427,43 +551,38 @@ def shapes_to_boxes(shapes, img_w: int, img_h: int, key_frame_name: str, prev_bo
         nw = max(0.0, min(1.0, nw))
         nh = max(0.0, min(1.0, nh))
 
-        label = BOX_CLASSES[0]
         if i < len(prev_boxes):
             label = prev_boxes[i].get("label", BOX_CLASSES[0])
+        else:
+            label = active_class or BOX_CLASSES[0]
 
         out.append({"frame": key_frame_name, "label": label, "x": cx, "y": cy, "w": nw, "h": nh})
 
     return out
 
-def make_draw_figure(img: Image.Image, initial_boxes, img_w: int, img_h: int):
+
+def make_draw_figure(img: Image.Image, initial_boxes, img_w: int, img_h: int, active_class: str):
     """
-    Create a Plotly figure where user can draw rectangles.
-    Coordinates are in pixel space (0..img_w, 0..img_h).
+    Plotly figure where user can draw rectangles.
+    We color shapes based on the box 'label'.
     """
     img_b64 = pil_to_base64_png(img)
-
     fig = go.Figure()
 
-    # Add the image as background (bottom-left origin for x, top-left for y is handled by yaxis autorange='reversed')
     fig.add_layout_image(
         dict(
             source=f"data:image/png;base64,{img_b64}",
-            x=0,
-            y=0,
-            sizex=img_w,
-            sizey=img_h,
-            xref="x",
-            yref="y",
+            x=0, y=0,
+            sizex=img_w, sizey=img_h,
+            xref="x", yref="y",
             sizing="stretch",
             layer="below",
         )
     )
 
-    # Axes setup: pixel space
     fig.update_xaxes(range=[0, img_w], visible=False, constrain="domain")
-    fig.update_yaxes(range=[img_h, 0], visible=False, scaleanchor="x")  # reversed so (0,0) is top-left
+    fig.update_yaxes(range=[img_h, 0], visible=False, scaleanchor="x")
 
-    # Preload existing boxes as shapes
     shapes = []
     for b in initial_boxes or []:
         cx, cy, bw, bh = b["x"], b["y"], b["w"], b["h"]
@@ -474,37 +593,52 @@ def make_draw_figure(img: Image.Image, initial_boxes, img_w: int, img_h: int):
         right = left + wpx
         bottom = top + hpx
 
+        label = b.get("label", BOX_CLASSES[0])
+        fill = BOX_CLASS_STYLE.get(label, "rgba(255,0,0,0.15)")
+
         shapes.append(
             dict(
                 type="rect",
-                x0=left,
-                y0=top,
-                x1=right,
-                y1=bottom,
+                x0=left, y0=top, x1=right, y1=bottom,
                 line=dict(width=2),
-                fillcolor="rgba(255,0,0,0.15)",
+                fillcolor=fill,
             )
         )
 
     fig.update_layout(
         shapes=shapes,
         dragmode="drawrect",
-        newshape=dict(line=dict(width=2), fillcolor="rgba(255,0,0,0.15)"),
+        newshape=dict(
+            line=dict(width=2),
+            fillcolor=BOX_CLASS_STYLE.get(active_class, "rgba(255,0,0,0.15)")
+        ),
         margin=dict(l=0, r=0, t=0, b=0),
         height=min(900, max(300, int(img_h * 0.9))),
-    )
-
-    # Optional: add modebar tools for editing
-    fig.update_layout(
         modebar_add=["drawrect", "eraseshape"],
     )
-
     return fig
+
 
 
 def ui_selector_page():
     st.title("Traffic Violation Labeler — Phase-1")
     st.subheader("Project / Video selector")
+
+    with st.expander("📌 How to use this labelling tool (quick workflow)", expanded=True):
+        st.markdown(
+            """
+    **Step 1 — Select video + annotator**
+    - Choose the video folder
+    - Enter your name (used in Mongo records)
+
+    **Step 2 — Start labeling**
+    - Add **Violation Tags** (multi-label) for the clip (left sidebar)
+    - Choose **Key frame** (slider)
+    - Choose a **Box class**, then **draw boxes**
+    - Edit labels if needed and hit **Save** or **Done & Next**
+            """
+        )
+
 
     db = get_db()
     ensure_indexes(db)
@@ -545,8 +679,16 @@ def ui_selector_page():
 
 def ui_keyboard_shortcuts():
     """
-    Keyboard shortcuts via streamlit-keyup (recommended).
-    If not installed, app still works via buttons.
+    Keyboard shortcuts via streamlit-keyup.
+    Frame-level:
+      A = prev clip
+      D = next clip
+      U = mark current frame unclear
+      X = discard current frame
+      C = usable current frame
+      0 = clear tags for current frame
+      1-4 = toggle tags for current frame
+      S = save
     """
     try:
         from streamlit_keyup import st_keyup  # type: ignore
@@ -559,9 +701,31 @@ def ui_keyboard_shortcuts():
         return
 
     key = str(key).strip().upper()
-    if key == st.session_state.keyboard_last:
+    if key == st.session_state.get("keyboard_last", ""):
         return
     st.session_state.keyboard_last = key
+
+    # Need these to exist
+    clip = current_clip()
+    frame_files = clip.get("frame_files") or []
+    if not frame_files:
+        frame_files = [f"frame_{i:06d}.jpg" for i in range(len(clip.get("frames", [])))]
+
+    st.session_state.frame_idx = max(0, min(int(st.session_state.frame_idx), len(frame_files) - 1))
+    frame_name = frame_files[st.session_state.frame_idx]
+
+    # Ensure maps exist
+    st.session_state.frame_status_map.setdefault(frame_name, "usable")
+    st.session_state.frame_tags_map.setdefault(frame_name, [])
+
+    def toggle_frame_tag(tag: str):
+        tags = set(st.session_state.frame_tags_map.get(frame_name, []))
+        if tag in tags:
+            tags.remove(tag)
+        else:
+            tags.add(tag)
+        st.session_state.frame_tags_map[frame_name] = sorted(tags)
+        autosave_annotation()
 
     if key == "A":
         move_next_filtered(-1)
@@ -569,44 +733,66 @@ def ui_keyboard_shortcuts():
     elif key == "D":
         move_next_filtered(1)
         st.rerun()
+    elif key == "C":  # usable
+        st.session_state.frame_status_map[frame_name] = "usable"
+        autosave_annotation()
+        st.rerun()
+    elif key == "X":  # discard
+        st.session_state.frame_status_map[frame_name] = "discarded"
+        st.session_state.frame_tags_map[frame_name] = []
+        st.session_state.canvas_boxes = []
+        autosave_annotation()
+        st.rerun()
+    elif key == "U":  # unclear
+        st.session_state.frame_status_map[frame_name] = "unclear"
+        autosave_annotation()
+        st.rerun()
     elif key == "0":
-        clear_tags()
+        st.session_state.frame_tags_map[frame_name] = []
+        autosave_annotation()
         st.rerun()
     elif key == "1":
-        toggle_tag("no_helmet")
+        toggle_frame_tag("no_helmet")
         st.rerun()
     elif key == "2":
-        toggle_tag("triple_riding")
+        toggle_frame_tag("triple_riding")
         st.rerun()
     elif key == "3":
-        toggle_tag("signal_jump")
+        toggle_frame_tag("signal_jump")
         st.rerun()
     elif key == "4":
-        toggle_tag("phone_driving")
-        st.rerun()
-    elif key == "U":
-        set_status("unclear")
-        move_next_filtered(1)
+        toggle_frame_tag("phone_driving")
         st.rerun()
     elif key == "S":
         autosave_annotation()
         st.toast("Saved", icon="✅")
 
 
+
 def ui_labeling_page():
+    # -----------------------------
+    # Guard + basic vars
+    # -----------------------------
     if not st.session_state.video_folder:
         st.session_state.page = "selector"
         st.rerun()
 
     video = st.session_state.video_folder
-    clips = st.session_state.clips
-    ann_map = st.session_state.ann_map
-    idx = st.session_state.clip_idx
+    clips = st.session_state.clips or []
+    ann_map = st.session_state.ann_map or {}
+    idx = int(st.session_state.clip_idx)
     n = len(clips)
 
+    if n == 0:
+        st.error("No clips loaded. Go back and load a project.")
+        return
+
+    idx = max(0, min(idx, n - 1))
+    st.session_state.clip_idx = idx
+
     counts = compute_progress_counts(clips, ann_map)
-    remaining = n - (counts["done"] + counts["skipped"] + counts["unclear"])
-    done_total = counts["done"] + counts["skipped"] + counts["unclear"]
+    remaining = n - (counts.get("done", 0) + counts.get("skipped", 0) + counts.get("unclear", 0))
+    done_total = counts.get("done", 0) + counts.get("skipped", 0) + counts.get("unclear", 0)
     progress = 0.0 if n == 0 else done_total / n
 
     st.title("Labeling workspace")
@@ -615,70 +801,91 @@ def ui_labeling_page():
 
     ui_keyboard_shortcuts()
 
-    with st.sidebar:
-        st.header("Tags (clip-level)")
+    # -----------------------------
+    # Clip docs + frame lists
+    # -----------------------------
+    clip = clips[idx]
+    frame_files = clip.get("frame_files") or []
+    frame_ids = clip.get("frames") or []
 
-        def _on_tag_change():
+    if not frame_files and frame_ids:
+        frame_files = [f"frame_{i:06d}.jpg" for i in range(len(frame_ids))]
+
+    if (not frame_ids) or (not frame_files) or (len(frame_ids) != len(frame_files)):
+        st.error(
+            "Clip document is missing expected fields. Expected: "
+            "frame_files(list[str]) and frames(list[gridfs_id]) of same length."
+        )
+        st.stop()
+
+    # Ensure frame_idx is valid
+    st.session_state.frame_idx = max(0, min(int(st.session_state.frame_idx), len(frame_files) - 1))
+
+    # Current working frame
+    frame_name = frame_files[st.session_state.frame_idx]
+    frame_id = frame_ids[st.session_state.frame_idx]
+
+    # -----------------------------
+    # Sidebar: Triage + Frame tags + Tools
+    # -----------------------------
+    with st.sidebar:
+        st.header("Stage A — Triage + Tags (Frame-level)")
+        st.caption("1) Mark frame usable/discarded/unclear")
+        st.caption("2) Add violation tags for this frame (if any)")
+        st.caption("3) Only if needed → draw boxes for this frame")
+
+        # Defensive: ensure maps exist
+        if "frame_status_map" not in st.session_state or not isinstance(st.session_state.frame_status_map, dict):
+            st.session_state.frame_status_map = {}
+        if "frame_tags_map" not in st.session_state or not isinstance(st.session_state.frame_tags_map, dict):
+            st.session_state.frame_tags_map = {}
+
+        # Ensure keys exist for all frames
+        for f in frame_files:
+            st.session_state.frame_status_map.setdefault(f, "usable")
+            st.session_state.frame_tags_map.setdefault(f, [])
+
+        st.subheader("Frame usability")
+        cA1, cA2, cA3 = st.columns(3)
+        if cA1.button("✅ Usable"):
+            st.session_state.frame_status_map[frame_name] = "usable"
+            autosave_annotation()
+            st.rerun()
+        if cA2.button("❌ Discard"):
+            st.session_state.frame_status_map[frame_name] = "discarded"
+            st.session_state.frame_tags_map[frame_name] = []
+            st.session_state.canvas_boxes = []
+            autosave_annotation()
+            st.rerun()
+        if cA3.button("🤷 Unclear"):
+            st.session_state.frame_status_map[frame_name] = "unclear"
+            autosave_annotation()
+            st.rerun()
+
+        st.write(f"Current: **{st.session_state.frame_status_map.get(frame_name, 'usable')}**")
+
+        st.subheader("Violation tags (this frame)")
+
+        def _on_frame_tag_change():
+            # No need to call init_session() here; it can reset keys unexpectedly
             tags = []
             for t in VIOLATION_TAGS:
-                if st.session_state.get(f"tag_{t}", False):
+                if st.session_state.get(f"ftag_{t}", False):
                     tags.append(t)
-            st.session_state.tags = tags
+            st.session_state.frame_tags_map[frame_name] = tags
             autosave_annotation()
 
-        tags_set = set(st.session_state.tags)
+        tags_set = set(st.session_state.frame_tags_map.get(frame_name, []))
         for t in VIOLATION_TAGS:
-            st.checkbox(t, key=f"tag_{t}", value=(t in tags_set), on_change=_on_tag_change)
-
-        st.divider()
-
-        st.subheader("Quick buttons")
-        colb1, colb2, colb3 = st.columns(3)
-        if colb1.button("No violation (0)"):
-            clear_tags()
-            st.toast("Tags cleared", icon="🧹")
-        if colb2.button("Unclear (U)"):
-            set_status("unclear")
-            move_next_filtered(1)
-            st.rerun()
-        if colb3.button("Save (S)"):
-            autosave_annotation()
-            st.toast("Saved", icon="✅")
-
-        st.divider()
-
-        st.subheader("Review status")
-        st.write(f"Current: **{st.session_state.review_status}**")
-
-        col1, col2, col3 = st.columns(3)
-        if col1.button("✅ Done & Next"):
-            set_status("done")
-            move_next_filtered(1)
-            st.rerun()
-        if col2.button("⏭ Skip & Next"):
-            set_status("skipped")
-            move_next_filtered(1)
-            st.rerun()
-        if col3.button("🤷 Unclear & Next"):
-            set_status("unclear")
-            move_next_filtered(1)
-            st.rerun()
-
-        col4, col5 = st.columns(2)
-        if col4.button("↩ Prev (A)"):
-            move_next_filtered(-1)
-            st.rerun()
-        if col5.button("⏩ Next (D)"):
-            move_next_filtered(1)
-            st.rerun()
+            st.checkbox(t, key=f"ftag_{t}", value=(t in tags_set), on_change=_on_frame_tag_change)
 
         st.divider()
 
         st.subheader("Tools")
-        if st.button("Copy boxes from previous"):
+        if st.button("Copy boxes from previous clip"):
             copy_boxes_from_previous_clip()
             st.rerun()
-        if st.button("Clear boxes (key frame)"):
+        if st.button("Clear boxes (this frame)"):
             clear_boxes_current_keyframe()
             st.rerun()
         if st.button("Propagate boxes to all frames (optional)"):
@@ -695,86 +902,104 @@ def ui_labeling_page():
 
         st.divider()
         st.markdown("### Progress")
-        st.write(f"Done: **{counts['done']}**")
-        st.write(f"Skipped: **{counts['skipped']}**")
-        st.write(f"Unclear: **{counts['unclear']}**")
+        st.write(f"Done: **{counts.get('done', 0)}**")
+        st.write(f"Skipped: **{counts.get('skipped', 0)}**")
+        st.write(f"Unclear: **{counts.get('unclear', 0)}**")
         st.write(f"Remaining: **{remaining}**")
 
-        st.caption("Shortcuts: A prev, D next, 0 clear tags, 1-4 toggle tags, U unclear, S save")
+        st.caption("Shortcuts: A prev, D next, U unclear, S save")
 
-    # Main area
-    clip = clips[idx]
-
-    # IMPORTANT:
-    # - frame_files = filenames for annotation keys ("frame": "frame_000140.jpg")
-    # - frame_ids   = GridFS file ids used to fetch image bytes
-    frame_files = clip.get("frame_files") or []
-    frame_ids = clip.get("frames") or []
-
-    if not frame_files and frame_ids:
-        frame_files = [f"frame_{i:06d}.jpg" for i in range(len(frame_ids))]
-
-    if not frame_ids or not frame_files or len(frame_ids) != len(frame_files):
-        st.error("Clip document is missing expected fields. Expected: frame_files(list[str]) and frames(list[gridfs_id]) of same length.")
-        st.stop()
-
+    # -----------------------------
+    # Main: Frame thumbnails + frame selector
+    # -----------------------------
     st.subheader(f"Clip {clip['clip_id']} — {len(frame_files)} frames")
     cols = st.columns(len(frame_files))
     for j, fname in enumerate(frame_files):
-        frame_id = frame_ids[j]
-        img = load_frame_image_cached(video_id=video, frame_id=frame_id, max_w=220)
+        thumb = load_frame_image_cached(video_id=video, frame_id=frame_ids[j], max_w=220)
         with cols[j]:
-            st.image(img, caption=f"{j}: {fname}", width="stretch")
+            st.image(thumb, caption=..., width="stretch")
+
 
     k = st.slider(
-        "Select key frame for boxes",
+        "Select working frame (for triage/tags/boxes)",
         min_value=0,
         max_value=len(frame_files) - 1,
-        value=st.session_state.key_frame_idx,
+        value=int(st.session_state.frame_idx),
     )
-    if k != st.session_state.key_frame_idx:
-        st.session_state.key_frame_idx = k
-        refresh_boxes_for_key_frame()
+    if k != st.session_state.frame_idx:
+        st.session_state.frame_idx = k
+        refresh_boxes_for_selected_frame()
         autosave_state_only()
+        st.rerun()
 
-    key_frame_name = frame_files[st.session_state.key_frame_idx]
-    key_frame_id = frame_ids[st.session_state.key_frame_idx]
-    img = load_frame_image_cached(video_id=video, frame_id=key_frame_id, max_w=1100)
+    # Update working frame after slider
+    frame_name = frame_files[st.session_state.frame_idx]
+    frame_id = frame_ids[st.session_state.frame_idx]
+
+    # -----------------------------
+    # Main: Draw boxes UI
+    # -----------------------------
+    img = load_frame_image_cached(video_id=video, frame_id=frame_id, max_w=1100)
     img_w, img_h = img.size
 
-    st.markdown("### Draw boxes (key frame)")
+    st.markdown("### Draw boxes (current frame)")
     st.caption("Boxes are saved as normalized YOLO-style center coords: x,y,w,h (0–1).")
-    st.caption("Plotly tip: drag to draw rectangles. Use the eraser tool (modebar) to delete shapes.")
+    st.caption("Tip: draw rectangles. Use eraser tool to delete.")
 
-    # OPTIONAL persistence: reuse last fig for this clip+frame
-    if "plotly_fig_state" not in st.session_state:
-        st.session_state.plotly_fig_state = {}
+    frame_status = st.session_state.frame_status_map.get(frame_name, "usable")
+    frame_tags = st.session_state.frame_tags_map.get(frame_name, [])
 
-    fig_key = f"fig_{video}_{clip['clip_id']}_{key_frame_name}"
+    if frame_status != "usable":
+        st.info("This frame is not marked usable. Mark it usable to draw boxes.")
+        st.stop()
 
-    if fig_key in st.session_state.plotly_fig_state:
-        fig = st.session_state.plotly_fig_state[fig_key]
-    else:
-        fig = make_draw_figure(
-            img=img,
-            initial_boxes=st.session_state.canvas_boxes,
-            img_w=img_w,
-            img_h=img_h,
+    if len(frame_tags) == 0:
+        st.info(
+            "No violation tags for this frame. If this is clean, leave tags empty. "
+            "If violation exists, add tags first."
         )
+        # Not stopping—allow user to draw boxes if they want.
 
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
+    # Active class for new boxes
+    st.markdown("#### Active Box Class (new boxes will use this label)")
+    if "active_box_class" not in st.session_state:
+        st.session_state.active_box_class = BOX_CLASSES[0]
 
-    # Save fig back (important for persistence across reruns)
-    st.session_state.plotly_fig_state[fig_key] = fig
+    selected = st.selectbox(
+        "Box class",
+        BOX_CLASSES,
+        index=BOX_CLASSES.index(st.session_state.active_box_class)
+        if st.session_state.active_box_class in BOX_CLASSES
+        else 0,
+        key="active_box_class_select",
+    )
+    st.session_state.active_box_class = selected
 
-    # Convert shapes -> boxes
+    # Build draw figure (always rebuild from current boxes)
+    fig = make_draw_figure(
+        img=img,
+        initial_boxes=st.session_state.canvas_boxes,
+        img_w=img_w,
+        img_h=img_h,
+        active_class=st.session_state.active_box_class,
+    )
+
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": True})
+
+    if frame_tags and not st.session_state.canvas_boxes:
+        st.info("This frame has violation tags. Draw at least one relevant box (if localization is needed).")
+    if st.session_state.canvas_boxes and len(frame_tags) == 0:
+        st.info("You drew boxes but this frame has no violation tags. Add matching frame-level tags in the sidebar.")
+
+    # Convert shapes → boxes and autosave if changed
     shapes = getattr(fig.layout, "shapes", []) or []
     new_boxes = shapes_to_boxes(
         shapes=shapes,
         img_w=img_w,
         img_h=img_h,
-        key_frame_name=key_frame_name,
+        key_frame_name=frame_name,  # function param name kept as-is
         prev_boxes=st.session_state.canvas_boxes,
+        active_class=st.session_state.active_box_class,
     )
 
     new_hash = json.dumps(new_boxes, sort_keys=True)
@@ -783,10 +1008,12 @@ def ui_labeling_page():
         st.session_state.last_canvas_hash = new_hash
         autosave_annotation()
 
-
+    # -----------------------------
+    # Box list (editable labels)
+    # -----------------------------
     st.markdown("### Box list (editable labels)")
     if not st.session_state.canvas_boxes:
-        st.info("No boxes for this key frame yet.")
+        st.info("No boxes for this frame yet.")
     else:
         for i_b, b in enumerate(st.session_state.canvas_boxes):
             c1, c2, c3 = st.columns([2, 2, 6])
@@ -796,30 +1023,22 @@ def ui_labeling_page():
                 new_label = st.selectbox(
                     "Class",
                     BOX_CLASSES,
-                    index=BOX_CLASSES.index(b["label"]) if b["label"] in BOX_CLASSES else 0,
-                    key=f"boxlabel_{clip['clip_id']}_{key_frame_name}_{i_b}",
+                    index=BOX_CLASSES.index(b["label"]) if b.get("label") in BOX_CLASSES else 0,
+                    key=f"boxlabel_{clip['clip_id']}_{frame_name}_{i_b}",
                 )
-                if new_label != b["label"]:
+                if new_label != b.get("label"):
                     st.session_state.canvas_boxes[i_b]["label"] = new_label
                     autosave_annotation()
                     st.rerun()
             with c3:
-                st.write(f"{b['frame']} | x={b['x']:.3f}, y={b['y']:.3f}, w={b['w']:.3f}, h={b['h']:.3f}")
+                st.write(
+                    f"{b.get('frame', frame_name)} | "
+                    f"x={b.get('x', 0):.3f}, y={b.get('y', 0):.3f}, "
+                    f"w={b.get('w', 0):.3f}, h={b.get('h', 0):.3f}"
+                )
 
     st.divider()
-    st.subheader("Pass-1 triage helpers")
-    ctri1, ctri2, ctri3 = st.columns(3)
-    if ctri1.button("0 — No violation (clear tags)"):
-        clear_tags()
-        st.toast("No violation set (tags cleared)", icon="✅")
-    if ctri2.button("Mark Done (triage)"):
-        set_status("done")
-        st.toast("Marked done", icon="✅")
-    if ctri3.button("Skip (blur)"):
-        set_status("skipped")
-        st.toast("Skipped", icon="⏭")
-
-    st.caption("Tip: For violations (any tag), do Pass-2: draw boxes on key frame (and optionally propagate).")
+    st.caption("Tip: Triage + tags first. Boxes only for frames that actually need localization.")
 
 
 def main():

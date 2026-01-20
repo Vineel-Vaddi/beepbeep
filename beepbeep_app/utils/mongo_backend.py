@@ -14,18 +14,6 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-@staticmethod
-def _get_mongo_uri_from_streamlit_secrets() -> Optional[str]:
-    # Works on Streamlit Cloud if you add secrets, else falls back to env var.
-    try:
-        import streamlit as st
-        if "mongo" in st.secrets and "uri" in st.secrets["mongo"]:
-            return str(st.secrets["mongo"]["uri"]).strip()
-    except Exception:
-        pass
-    return os.environ.get("MONGO_URI")
-
-
 def get_db(db_name: str = DB_NAME_DEFAULT):
     uri = _get_mongo_uri_from_streamlit_secrets()
     if not uri:
