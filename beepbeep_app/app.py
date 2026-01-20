@@ -24,6 +24,8 @@ from utils.mongo_backend import (
     load_frame_image_cached,
 )
 
+st.set_page_config(page_title="Traffic Violation Labeler (Phase-1)", layout="wide")
+
 # -----------------------------
 # Fixed label sets (Phase-1)
 # -----------------------------
@@ -1074,7 +1076,7 @@ def _clip_has_violations(frame_files_local):
 
 
 def main():
-    st.set_page_config(page_title="Traffic Violation Labeler (Phase-1)", layout="wide")
+    
     init_session()
 
     if st.session_state.page == "selector":
