@@ -5,11 +5,9 @@ from typing import Dict, Any, Optional
 import streamlit as st
 import base64
 import io
-import plotly.graph_objects as go
 from PIL import Image
 
-from utils.yolo_export import upsert_yolo_labels_for_clip
-
+from utils.yolo_export import export_yolo_to_mongo
 
 from utils.mongo_backend import (
     get_db,
@@ -322,7 +320,7 @@ def clip_record_from_ui() -> Dict[str, Any]:
 
 
 def autosave_annotation():
-    """Upsert record to Mongo and update ann_map (latest wins)."""
+    """Upsert record to Mongo and keep YOLO labels in sync (per-clip)."""
     if not st.session_state.video_folder:
         return
 
@@ -331,9 +329,13 @@ def autosave_annotation():
 
     upsert_annotation(db, rec)
     st.session_state.ann_map[rec["clip_id"]] = rec
+
+    # ✅ fast incremental YOLO sync (only this clip)
     upsert_yolo_labels_for_clip(db, rec)
 
     autosave_state_only()
+
+
 
 
 def autosave_state_only():
@@ -537,116 +539,6 @@ def handle_jump():
         return
     st.session_state.clip_idx = max(0, min(j, len(clips) - 1))
     load_clip_into_ui()
-
-def pil_to_base64_png(img: Image.Image) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-
-def shapes_to_boxes(shapes, img_w: int, img_h: int, key_frame_name: str, prev_boxes=None, active_class=None):
-    """
-    Convert Plotly rect shapes to normalized YOLO center coords.
-    Preserve labels by index; any NEW shape gets active_class.
-    """
-    prev_boxes = prev_boxes or []
-    out = []
-    if not shapes:
-        return out
-
-    for i, s in enumerate(shapes):
-        x0 = float(getattr(s, "x0", 0))
-        x1 = float(getattr(s, "x1", 0))
-        y0 = float(getattr(s, "y0", 0))
-        y1 = float(getattr(s, "y1", 0))
-
-        left = min(x0, x1)
-        right = max(x0, x1)
-        top = min(y0, y1)
-        bottom = max(y0, y1)
-
-        w = right - left
-        h = bottom - top
-        if img_w <= 0 or img_h <= 0 or w <= 0 or h <= 0:
-            continue
-
-        cx = (left + w / 2.0) / img_w
-        cy = (top + h / 2.0) / img_h
-        nw = w / img_w
-        nh = h / img_h
-
-        cx = max(0.0, min(1.0, cx))
-        cy = max(0.0, min(1.0, cy))
-        nw = max(0.0, min(1.0, nw))
-        nh = max(0.0, min(1.0, nh))
-
-        if i < len(prev_boxes):
-            label = prev_boxes[i].get("label", BOX_CLASSES[0])
-        else:
-            label = active_class or BOX_CLASSES[0]
-
-        out.append({"frame": key_frame_name, "label": label, "x": cx, "y": cy, "w": nw, "h": nh})
-
-    return out
-
-
-def make_draw_figure(img: Image.Image, initial_boxes, img_w: int, img_h: int, active_class: str):
-    """
-    Plotly figure where user can draw rectangles.
-    We color shapes based on the box 'label'.
-    """
-    img_b64 = pil_to_base64_png(img)
-    fig = go.Figure()
-
-    fig.add_layout_image(
-        dict(
-            source=f"data:image/png;base64,{img_b64}",
-            x=0, y=0,
-            sizex=img_w, sizey=img_h,
-            xref="x", yref="y",
-            sizing="stretch",
-            layer="below",
-        )
-    )
-
-    fig.update_xaxes(range=[0, img_w], visible=False, constrain="domain")
-    fig.update_yaxes(range=[img_h, 0], visible=False, scaleanchor="x")
-
-    shapes = []
-    for b in initial_boxes or []:
-        cx, cy, bw, bh = b["x"], b["y"], b["w"], b["h"]
-        wpx = bw * img_w
-        hpx = bh * img_h
-        left = cx * img_w - wpx / 2.0
-        top = cy * img_h - hpx / 2.0
-        right = left + wpx
-        bottom = top + hpx
-
-        label = b.get("label", BOX_CLASSES[0])
-        fill = BOX_CLASS_STYLE.get(label, "rgba(255,0,0,0.15)")
-
-        shapes.append(
-            dict(
-                type="rect",
-                x0=left, y0=top, x1=right, y1=bottom,
-                line=dict(width=2),
-                fillcolor=fill,
-            )
-        )
-
-    fig.update_layout(
-        shapes=shapes,
-        dragmode="drawrect",
-        newshape=dict(
-            line=dict(width=2),
-            fillcolor=BOX_CLASS_STYLE.get(active_class, "rgba(255,0,0,0.15)")
-        ),
-        margin=dict(l=0, r=0, t=0, b=0),
-        height=min(900, max(300, int(img_h * 0.9))),
-        modebar_add=["drawrect", "eraseshape"],
-    )
-    return fig
-
 
 
 def ui_selector_page():
@@ -979,36 +871,60 @@ def ui_labeling_page():
     # -----------------------------
     st.markdown("### Draw Boxes")
 
-    st.markdown("#### Active Box Class")
+    # Active label used ONLY for *new* boxes
+    st.markdown("#### Active Box Class (new boxes)")
     if "active_box_class" not in st.session_state:
         st.session_state.active_box_class = BOX_CLASSES[0]
 
     st.session_state.active_box_class = st.selectbox(
         "Box class",
         BOX_CLASSES,
-        index=BOX_CLASSES.index(st.session_state.active_box_class),
+        index=BOX_CLASSES.index(st.session_state.active_box_class)
+        if st.session_state.active_box_class in BOX_CLASSES else 0,
+        key="active_box_class_select",
     )
 
+    # Build initial rectangles from saved boxes (so redraw shows existing boxes)
     initial_rects = []
-    for b in st.session_state.canvas_boxes or []:
-        cx, cy, bw, bh = b["x"], b["y"], b["w"], b["h"]
+    for b in (st.session_state.canvas_boxes or []):
+        # Only draw boxes for current frame
+        if b.get("frame") != frame_name:
+            continue
+
+        cx, cy, bw, bh = float(b["x"]), float(b["y"]), float(b["w"]), float(b["h"])
         wpx = bw * img_w
         hpx = bh * img_h
-        left = cx * img_w - wpx / 2
-        top = cy * img_h - hpx / 2
+        left = cx * img_w - wpx / 2.0
+        top  = cy * img_h - hpx / 2.0
 
         initial_rects.append(
             {
                 "type": "rect",
-                "left": left,
-                "top": top,
-                "width": wpx,
-                "height": hpx,
+                "left": float(left),
+                "top": float(top),
+                "width": float(wpx),
+                "height": float(hpx),
                 "stroke": "red",
                 "strokeWidth": 2,
                 "fill": "rgba(255,0,0,0.2)",
+                # store label in object metadata so we can preserve it
+                "name": b.get("label", st.session_state.active_box_class),
             }
         )
+
+    # Helpful: clear boxes for current frame
+    c_clear, c_hint = st.columns([1, 3])
+    with c_clear:
+        if st.button("🧹 Clear boxes (this frame)"):
+            # Remove only current frame boxes
+            st.session_state.canvas_boxes = [
+                b for b in (st.session_state.canvas_boxes or [])
+                if b.get("frame") != frame_name
+            ]
+            autosave_annotation()
+            st.rerun()
+    with c_hint:
+        st.caption("Draw rectangles → click **Submit Boxes** to save them into MongoDB.")
 
     canvas = st_canvas(
         background_image=img,
@@ -1019,31 +935,63 @@ def ui_labeling_page():
         key=f"canvas_{clip['clip_id']}_{frame_name}",
     )
 
+    # Submit boxes: read canvas objects -> normalized YOLO -> update session_state.canvas_boxes
     if st.button("✅ Submit Boxes", type="primary"):
-        objects = (canvas.json_data or {}).get("objects", [])
-        new_boxes = []
+        objects = (canvas.json_data or {}).get("objects", []) or []
 
-        for obj in objects:
-            left = obj["left"]
-            top = obj["top"]
-            wpx = obj["width"]
-            hpx = obj["height"]
+        # Keep boxes from other frames
+        other_frame_boxes = [
+            b for b in (st.session_state.canvas_boxes or [])
+            if b.get("frame") != frame_name
+        ]
 
-            cx = (left + wpx / 2) / img_w
-            cy = (top + hpx / 2) / img_h
-            nw = wpx / img_w
-            nh = hpx / img_h
+        # We will preserve old labels by index if possible.
+        # Get previous boxes for this frame (order-based)
+        prev_frame_boxes = [
+            b for b in (st.session_state.canvas_boxes or [])
+            if b.get("frame") == frame_name
+        ]
 
-            new_boxes.append({
+        new_frame_boxes = []
+        for i_obj, obj in enumerate(objects):
+            left = float(obj.get("left", 0))
+            top = float(obj.get("top", 0))
+            wpx = float(obj.get("width", 0))
+            hpx = float(obj.get("height", 0))
+
+            if wpx <= 0 or hpx <= 0:
+                continue
+
+            cx = (left + wpx / 2.0) / float(img_w)
+            cy = (top + hpx / 2.0) / float(img_h)
+            nw = wpx / float(img_w)
+            nh = hpx / float(img_h)
+
+            # clamp
+            cx = max(0.0, min(1.0, cx))
+            cy = max(0.0, min(1.0, cy))
+            nw = max(0.0, min(1.0, nw))
+            nh = max(0.0, min(1.0, nh))
+
+            # LABEL RULE:
+            # - if old box existed at same index -> keep that label
+            # - else use active_box_class
+            if i_obj < len(prev_frame_boxes):
+                label = prev_frame_boxes[i_obj].get("label", st.session_state.active_box_class)
+            else:
+                label = st.session_state.active_box_class
+
+            new_frame_boxes.append({
                 "frame": frame_name,
-                "label": st.session_state.active_box_class,
+                "label": label,
                 "x": cx, "y": cy, "w": nw, "h": nh
             })
 
-        st.session_state.canvas_boxes = new_boxes
+        st.session_state.canvas_boxes = other_frame_boxes + new_frame_boxes
         autosave_annotation()
         st.toast("Boxes saved", icon="✅")
         st.rerun()
+
 
     # -----------------------------
     # Box List
@@ -1076,6 +1024,34 @@ def ui_labeling_page():
 
     st.divider()
     st.caption("Workflow: Frame triage → frame tags → draw boxes → submit → move next.")
+
+    st.divider()
+    st.subheader("Submit Clip")
+
+    c1, c2, c3 = st.columns(3)
+
+    if c1.button("✅ Done"):
+        st.session_state.ann_map[clip["clip_id"]]["review_status"] = "done"
+        autosave_annotation()
+        move_next_filtered(1)
+        st.rerun()
+
+    if c2.button("⏭ Skip"):
+        st.session_state.ann_map[clip["clip_id"]]["review_status"] = "skipped"
+        autosave_annotation()
+        move_next_filtered(1)
+        st.rerun()
+
+    if c3.button("🚫 No Violation"):
+        # mark all usable frames as clean
+        for f in frame_files:
+            if st.session_state.frame_status_map[f] == "usable":
+                st.session_state.frame_tags_map[f] = []
+
+        autosave_annotation()
+        move_next_filtered(1)
+        st.rerun()
+
 
     # -----------------------------
 # Clip-level submit controls (add near the BOTTOM of ui_labeling_page())
