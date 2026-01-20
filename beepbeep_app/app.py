@@ -8,6 +8,7 @@ import io
 import plotly.graph_objects as go
 from PIL import Image
 
+from utils.yolo_export import upsert_yolo_labels_for_clip
 
 
 from utils.mongo_backend import (
@@ -114,46 +115,73 @@ def load_project(video_folder: str):
 
 
 def load_clip_into_ui():
-    """Load frame-level triage/tags and current frame boxes for selected frame."""
-    video_folder = st.session_state.video_folder
-    if not video_folder:
+    """
+    Load frame-level triage/tags and current frame boxes for the selected frame.
+
+    Requirements implemented:
+    - Frame-level triage: frame_status_map[frame_file] ∈ {untriaged, usable, discarded, unclear}
+    - Frame-level tags:   frame_tags_map[frame_file] = [tags...]
+    - DO NOT mutate ann_map records in-place (copy dicts)
+    - Default frame selection is triage-first:
+        1) keep previously selected frame if valid
+        2) else first untriaged frame
+        3) else first usable frame
+        4) else 0
+    - After selecting frame_idx, load that frame’s boxes + persist state cursor
+    """
+    video_id = st.session_state.get("video_folder")
+    if not video_id:
         return
-    clips = st.session_state.clips
+
+    clips = st.session_state.get("clips")
     if not clips:
         return
 
-    clip_idx = max(0, min(st.session_state.clip_idx, len(clips) - 1))
+    clip_idx = int(st.session_state.get("clip_idx", 0))
+    clip_idx = max(0, min(clip_idx, len(clips) - 1))
+    st.session_state.clip_idx = clip_idx
+
     clip = clips[clip_idx]
-    clip_id = clip["clip_id"]
+    clip_id = clip.get("clip_id")
+    if clip_id is None:
+        return
 
-    rec = st.session_state.ann_map.get(clip_id, {}) or {}
+    # Existing annotation record (may be empty)
+    rec = (st.session_state.get("ann_map") or {}).get(clip_id, {}) or {}
 
+    # Frame filenames (authoritative keys for frame-level maps + boxes.frame)
     frame_files = clip.get("frame_files") or clip.get("frames_files") or []
     if not frame_files:
-        frame_files = [f"frame_{i:06d}.jpg" for i in range(len(clip.get("frames", []) or []))]
+        n_frames = len(clip.get("frames", []) or [])
+        frame_files = [f"frame_{i:08d}.jpg" for i in range(n_frames)]
 
-    # IMPORTANT: copy so we don't mutate ann_map objects accidentally
+    # Copy maps so we don't mutate rec inside ann_map
     frame_status_map = dict(rec.get("frame_status_map") or {})
     frame_tags_map = dict(rec.get("frame_tags_map") or {})
 
-    # Ensure every frame has keys
+    # Ensure every frame has keys (defaults)
     for f in frame_files:
-        frame_status_map.setdefault(f, "untriaged")  # default: untriaged
-        frame_tags_map.setdefault(f, [])             # default: no tags
+        frame_status_map.setdefault(f, "untriaged")  # triage-first default
+        frame_tags_map.setdefault(f, [])             # no tags by default
 
     st.session_state.frame_status_map = frame_status_map
     st.session_state.frame_tags_map = frame_tags_map
 
-    # Pick default frame_idx (triage-first)
+    # Pick frame_idx (triage-first), but keep user selection if still valid
     prev_idx = int(st.session_state.get("frame_idx", 0))
     if 0 <= prev_idx < len(frame_files):
-        st.session_state.frame_idx = prev_idx
+        chosen_idx = prev_idx
     else:
         untriaged_idxs = [i for i, f in enumerate(frame_files) if frame_status_map.get(f) == "untriaged"]
         usable_idxs = [i for i, f in enumerate(frame_files) if frame_status_map.get(f) == "usable"]
-        st.session_state.frame_idx = untriaged_idxs[0] if untriaged_idxs else (usable_idxs[0] if usable_idxs else 0)
+        chosen_idx = untriaged_idxs[0] if untriaged_idxs else (usable_idxs[0] if usable_idxs else 0)
 
+    st.session_state.frame_idx = chosen_idx
+
+    # Load boxes for the chosen frame into session_state.canvas_boxes
     refresh_boxes_for_selected_frame()
+
+    # Persist cursor/filter state (safe + lightweight)
     autosave_state_only()
 
 
@@ -303,6 +331,7 @@ def autosave_annotation():
 
     upsert_annotation(db, rec)
     st.session_state.ann_map[rec["clip_id"]] = rec
+    upsert_yolo_labels_for_clip(db, rec)
 
     autosave_state_only()
 
