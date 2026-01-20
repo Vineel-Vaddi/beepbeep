@@ -3,7 +3,59 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 import streamlit as st
+
+# ============================================================
+# PATCH (must be BEFORE importing st_canvas)
+# Fix for: AttributeError: streamlit.elements.image.image_to_url
+# streamlit-drawable-canvas expects image_to_url; newer Streamlit removed it.
+# This shim returns a browser-friendly data URL (no Streamlit internals needed).
+# ============================================================
+try:
+    import streamlit.elements.image as st_image
+    import base64
+    import io
+
+    from PIL import Image as PILImage
+
+    if not hasattr(st_image, "image_to_url"):
+        def image_to_url(image, width=None, clamp=False, channels="RGB", output_format="PNG"):
+            """
+            streamlit-drawable-canvas calls this to convert background_image to a URL.
+            We return a data URL: data:image/png;base64,...
+            Supports PIL Images (and attempts numpy arrays).
+            """
+            # If someone passes a numpy array, convert to PIL
+            if not isinstance(image, PILImage.Image):
+                try:
+                    import numpy as np
+                    if isinstance(image, np.ndarray):
+                        image = PILImage.fromarray(image)
+                except Exception:
+                    pass
+
+            if isinstance(image, PILImage.Image):
+                buf = io.BytesIO()
+                image.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                return f"data:image/png;base64,{b64}"
+
+            # Last resort: if it's already bytes-like
+            if isinstance(image, (bytes, bytearray)):
+                b64 = base64.b64encode(bytes(image)).decode("utf-8")
+                return f"data:image/png;base64,{b64}"
+
+            # If we can't convert, raise a helpful error
+            raise TypeError(f"Unsupported image type for image_to_url: {type(image)}")
+
+        st_image.image_to_url = image_to_url
+
+except Exception:
+    # Don't crash on import; you'll see errors if internals change again.
+    pass
+
 from streamlit_drawable_canvas import st_canvas
+
+
 
 from utils.mongo_backend import (
     get_db,
@@ -627,7 +679,7 @@ def ui_labeling_page():
         frame_id = frame_ids[j]
         img = load_frame_image_cached(video_id=video, frame_id=frame_id, max_w=220)
         with cols[j]:
-            st.image(img, caption=f"{j}: {fname}", use_container_width=True)
+            st.image(img, caption=f"{j}: {fname}", width="stretch")
 
     k = st.slider(
         "Select key frame for boxes",
