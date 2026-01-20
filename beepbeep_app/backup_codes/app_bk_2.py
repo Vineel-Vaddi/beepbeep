@@ -3,10 +3,57 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 import streamlit as st
-import base64
-import io
-import plotly.graph_objects as go
-from PIL import Image
+
+# ============================================================
+# PATCH (must be BEFORE importing st_canvas)
+# Fix for: AttributeError: streamlit.elements.image.image_to_url
+# streamlit-drawable-canvas expects image_to_url; newer Streamlit removed it.
+# This shim returns a browser-friendly data URL (no Streamlit internals needed).
+# ============================================================
+try:
+    import streamlit.elements.image as st_image
+    import base64
+    import io
+
+    from PIL import Image as PILImage
+
+    if not hasattr(st_image, "image_to_url"):
+        def image_to_url(image, width=None, clamp=False, channels="RGB", output_format="PNG"):
+            """
+            streamlit-drawable-canvas calls this to convert background_image to a URL.
+            We return a data URL: data:image/png;base64,...
+            Supports PIL Images (and attempts numpy arrays).
+            """
+            # If someone passes a numpy array, convert to PIL
+            if not isinstance(image, PILImage.Image):
+                try:
+                    import numpy as np
+                    if isinstance(image, np.ndarray):
+                        image = PILImage.fromarray(image)
+                except Exception:
+                    pass
+
+            if isinstance(image, PILImage.Image):
+                buf = io.BytesIO()
+                image.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                return f"data:image/png;base64,{b64}"
+
+            # Last resort: if it's already bytes-like
+            if isinstance(image, (bytes, bytearray)):
+                b64 = base64.b64encode(bytes(image)).decode("utf-8")
+                return f"data:image/png;base64,{b64}"
+
+            # If we can't convert, raise a helpful error
+            raise TypeError(f"Unsupported image type for image_to_url: {type(image)}")
+
+        st_image.image_to_url = image_to_url
+
+except Exception:
+    # Don't crash on import; you'll see errors if internals change again.
+    pass
+
+from streamlit_drawable_canvas import st_canvas
 
 
 
@@ -382,124 +429,32 @@ def handle_jump():
     st.session_state.clip_idx = max(0, min(j, len(clips) - 1))
     load_clip_into_ui()
 
-def pil_to_base64_png(img: Image.Image) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-
-def shapes_to_boxes(shapes, img_w: int, img_h: int, key_frame_name: str, prev_boxes=None):
+def normalize_box_from_canvas(obj: Dict[str, Any], img_w: int, img_h: int) -> Optional[Dict[str, float]]:
     """
-    Convert Plotly rect shapes to normalized YOLO center coords.
-    shapes: fig.layout.shapes
-    prev_boxes: existing boxes list (to preserve labels by index)
+    Canvas rect object -> normalized YOLO-style center coords.
+    st_canvas returns rect with left/top/width/height in pixels.
+    Output: x,y,w,h in [0,1] where x,y are center.
     """
-    prev_boxes = prev_boxes or []
-    out = []
+    if obj.get("type") != "rect":
+        return None
+    left = float(obj.get("left", 0))
+    top = float(obj.get("top", 0))
+    w = float(obj.get("width", 0))
+    h = float(obj.get("height", 0))
+    if img_w <= 0 or img_h <= 0 or w <= 0 or h <= 0:
+        return None
 
-    if not shapes:
-        return out
+    cx = (left + w / 2.0) / img_w
+    cy = (top + h / 2.0) / img_h
+    nw = w / img_w
+    nh = h / img_h
 
-    for i, s in enumerate(shapes):
-        # Plotly stores rect bounds as x0,x1,y0,y1 in data coords (pixels here)
-        x0 = float(getattr(s, "x0", 0))
-        x1 = float(getattr(s, "x1", 0))
-        y0 = float(getattr(s, "y0", 0))
-        y1 = float(getattr(s, "y1", 0))
-
-        left = min(x0, x1)
-        right = max(x0, x1)
-        top = min(y0, y1)
-        bottom = max(y0, y1)
-
-        w = right - left
-        h = bottom - top
-        if img_w <= 0 or img_h <= 0 or w <= 0 or h <= 0:
-            continue
-
-        cx = (left + w / 2.0) / img_w
-        cy = (top + h / 2.0) / img_h
-        nw = w / img_w
-        nh = h / img_h
-
-        cx = max(0.0, min(1.0, cx))
-        cy = max(0.0, min(1.0, cy))
-        nw = max(0.0, min(1.0, nw))
-        nh = max(0.0, min(1.0, nh))
-
-        label = BOX_CLASSES[0]
-        if i < len(prev_boxes):
-            label = prev_boxes[i].get("label", BOX_CLASSES[0])
-
-        out.append({"frame": key_frame_name, "label": label, "x": cx, "y": cy, "w": nw, "h": nh})
-
-    return out
-
-def make_draw_figure(img: Image.Image, initial_boxes, img_w: int, img_h: int):
-    """
-    Create a Plotly figure where user can draw rectangles.
-    Coordinates are in pixel space (0..img_w, 0..img_h).
-    """
-    img_b64 = pil_to_base64_png(img)
-
-    fig = go.Figure()
-
-    # Add the image as background (bottom-left origin for x, top-left for y is handled by yaxis autorange='reversed')
-    fig.add_layout_image(
-        dict(
-            source=f"data:image/png;base64,{img_b64}",
-            x=0,
-            y=0,
-            sizex=img_w,
-            sizey=img_h,
-            xref="x",
-            yref="y",
-            sizing="stretch",
-            layer="below",
-        )
-    )
-
-    # Axes setup: pixel space
-    fig.update_xaxes(range=[0, img_w], visible=False, constrain="domain")
-    fig.update_yaxes(range=[img_h, 0], visible=False, scaleanchor="x")  # reversed so (0,0) is top-left
-
-    # Preload existing boxes as shapes
-    shapes = []
-    for b in initial_boxes or []:
-        cx, cy, bw, bh = b["x"], b["y"], b["w"], b["h"]
-        wpx = bw * img_w
-        hpx = bh * img_h
-        left = cx * img_w - wpx / 2.0
-        top = cy * img_h - hpx / 2.0
-        right = left + wpx
-        bottom = top + hpx
-
-        shapes.append(
-            dict(
-                type="rect",
-                x0=left,
-                y0=top,
-                x1=right,
-                y1=bottom,
-                line=dict(width=2),
-                fillcolor="rgba(255,0,0,0.15)",
-            )
-        )
-
-    fig.update_layout(
-        shapes=shapes,
-        dragmode="drawrect",
-        newshape=dict(line=dict(width=2), fillcolor="rgba(255,0,0,0.15)"),
-        margin=dict(l=0, r=0, t=0, b=0),
-        height=min(900, max(300, int(img_h * 0.9))),
-    )
-
-    # Optional: add modebar tools for editing
-    fig.update_layout(
-        modebar_add=["drawrect", "eraseshape"],
-    )
-
-    return fig
+    cx = max(0.0, min(1.0, cx))
+    cy = max(0.0, min(1.0, cy))
+    nw = max(0.0, min(1.0, nw))
+    nh = max(0.0, min(1.0, nh))
+    return {"x": cx, "y": cy, "w": nw, "h": nh}
 
 
 def ui_selector_page():
@@ -744,45 +699,56 @@ def ui_labeling_page():
 
     st.markdown("### Draw boxes (key frame)")
     st.caption("Boxes are saved as normalized YOLO-style center coords: x,y,w,h (0–1).")
-    st.caption("Plotly tip: drag to draw rectangles. Use the eraser tool (modebar) to delete shapes.")
 
-    # OPTIONAL persistence: reuse last fig for this clip+frame
-    if "plotly_fig_state" not in st.session_state:
-        st.session_state.plotly_fig_state = {}
-
-    fig_key = f"fig_{video}_{clip['clip_id']}_{key_frame_name}"
-
-    if fig_key in st.session_state.plotly_fig_state:
-        fig = st.session_state.plotly_fig_state[fig_key]
-    else:
-        fig = make_draw_figure(
-            img=img,
-            initial_boxes=st.session_state.canvas_boxes,
-            img_w=img_w,
-            img_h=img_h,
+    initial_objects = []
+    for b in st.session_state.canvas_boxes:
+        cx, cy, bw, bh = b["x"], b["y"], b["w"], b["h"]
+        wpx = bw * img_w
+        hpx = bh * img_h
+        left = cx * img_w - wpx / 2.0
+        top = cy * img_h - hpx / 2.0
+        initial_objects.append(
+            {
+                "type": "rect",
+                "left": left,
+                "top": top,
+                "width": wpx,
+                "height": hpx,
+                "fill": "rgba(255, 0, 0, 0.15)",
+                "stroke": "rgba(255, 0, 0, 0.9)",
+                "strokeWidth": 2,
+            }
         )
 
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
-
-    # Save fig back (important for persistence across reruns)
-    st.session_state.plotly_fig_state[fig_key] = fig
-
-    # Convert shapes -> boxes
-    shapes = getattr(fig.layout, "shapes", []) or []
-    new_boxes = shapes_to_boxes(
-        shapes=shapes,
-        img_w=img_w,
-        img_h=img_h,
-        key_frame_name=key_frame_name,
-        prev_boxes=st.session_state.canvas_boxes,
+    canvas_result = st_canvas(
+        fill_color="rgba(255, 0, 0, 0.15)",
+        stroke_width=2,
+        stroke_color="rgba(255, 0, 0, 0.9)",
+        background_image=img,
+        update_streamlit=True,
+        height=img_h,
+        width=img_w,
+        drawing_mode="rect",
+        initial_drawing={"version": "4.4.0", "objects": initial_objects},
+        key=f"canvas_{video}_{clip['clip_id']}_{key_frame_name}",
     )
+
+    new_boxes = []
+    objects = (canvas_result.json_data or {}).get("objects", []) if canvas_result else []
+    for i_obj, obj in enumerate(objects):
+        nb = normalize_box_from_canvas(obj, img_w, img_h)
+        if nb is None:
+            continue
+        label = BOX_CLASSES[0]
+        if i_obj < len(st.session_state.canvas_boxes):
+            label = st.session_state.canvas_boxes[i_obj].get("label", BOX_CLASSES[0])
+        new_boxes.append({"frame": key_frame_name, "label": label, **nb})
 
     new_hash = json.dumps(new_boxes, sort_keys=True)
     if new_hash != st.session_state.last_canvas_hash:
         st.session_state.canvas_boxes = new_boxes
         st.session_state.last_canvas_hash = new_hash
         autosave_annotation()
-
 
     st.markdown("### Box list (editable labels)")
     if not st.session_state.canvas_boxes:
