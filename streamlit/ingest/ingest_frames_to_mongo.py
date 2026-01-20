@@ -22,7 +22,7 @@ from PIL import Image
 # ------------------------------------------------------------
 THIS_DIR = os.path.dirname(__file__)
 PROJECT_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
-STREAMLIT_ROOT = os.path.join(PROJECT_ROOT, "streamlit")
+STREAMLIT_ROOT = os.path.join(PROJECT_ROOT, "beepbeep_app")
 
 # Make "utils.*" importable (from streamlit/utils)
 if STREAMLIT_ROOT not in sys.path:

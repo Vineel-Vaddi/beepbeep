@@ -3,7 +3,7 @@ import json
 from typing import List, Dict, Any, Tuple
 from PIL import Image
 
-import streamlit as st
+import beepbeep_app as st
 
 # --- Streamlit cache compatibility ---
 # streamlit >= 1.18: st.cache_data
