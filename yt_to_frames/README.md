@@ -234,11 +234,9 @@ Always comply with:
 ## 👨‍💻 Author
 
 **Prashanth Katakam**
-AI & ML Independent Researcher | Vipplava AI
-India
+AI & ML Independent Researcher | India
 
 **Vineel Vaddi**
-AI & ML Independent Researcher | Vipplava AI
-India
+AI & ML Independent Researcher | India
 
 ---
